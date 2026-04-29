@@ -1,0 +1,51 @@
+[workspace]
+authors = ["Butterfingrz <13524387014@163.com>"]
+
+channels = ["https://srgconda.bj.bcebos.com/",
+            "https://prefix.dev/meta-forge",
+            "conda-forge",
+]
+
+name = "gemm4-attention-kernels"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[system-requirements]
+cuda = "12.9"
+
+[activation.env]
+CUDA_HOME = "$CONDA_PREFIX"
+CUDA_PATH = "$CONDA_PREFIX"
+CUDA_INC_PATH = "$CONDA_PREFIX/include"
+SCCACHE_CACHE_SIZE = "100G"
+PYTHONPATH = "$PIXI_PROJECT_ROOT"
+PATH = "$PIXI_PROJECT_ROOT/bin:$PATH"
+
+
+[tasks]
+move = "$PIXI_PROJECT_ROOT/bin/fix-nsight-libdw"
+nsys = "$PIXI_PROJECT_ROOT/bin/nsys"
+
+
+[dependencies]
+python = "3.12.*"
+cuda = "12.9.*"
+pytorch = "*"
+quack-kernels = {version = "*", channel = "https://srgconda.bj.bcebos.com/" }
+nvidia-cutlass-dsl = {version = "*", channel = "https://srgconda.bj.bcebos.com/" }
+apache-tvm-ffi = { version = "*", channel = "https://srgconda.bj.bcebos.com/" }
+
+matplotlib = "*"
+pytest = "*"
+transformers = "*"
+expecttest = "*"
+psutil = "*"
+elfutils = "*"
+tyro = "*"
+orjson = "*"
+sccache = "*"
+setuptools-scm = "*"
+ninja = "*"
+ccache = "*"
+pybind11 = "*"
+pre-commit = "*"

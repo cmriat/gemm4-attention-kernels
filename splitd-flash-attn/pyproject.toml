@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gemm4-attention-kernels"
+version = "0.1.0"
+description = "SplitD Flash Attention kernels for large head dimensions on SM90/Hopper"
+readme = {text = "# gemm4-attention-kernels\n", content-type = "text/markdown"}
+requires-python = ">=3.12,<3.13"
+license = "MIT"
+authors = [
+    {name = "Butterfingrz", email = "13524387014@163.com"},
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+]
+
+[project.urls]
+Homepage = "https://github.com/cmriat/gemm4-attention-kernels"
+Repository = "https://github.com/cmriat/gemm4-attention-kernels"
+
+[tool.setuptools]
+packages = ["splitd_flash_attn"]
+package-dir = {"splitd_flash_attn" = "src"}
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+src = ["src", "tests"]
+extend-exclude = ["assets"]
+
+[tool.ruff.lint]
+ignore = [
+    "E731",  # do not assign a lambda expression, use a def
+    "E741",  # Do not use variables named 'I', 'O', or 'l'
+    "F841",  # local variable is assigned to but never used
+    "D102",  # Missing docstring in public methods
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["splitd_flash_attn", "src"]
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/**.py" = ["E402"]
+"src/**.py" = ["ARG001", "ARG002", "ARG004", "B008"]
+"tests/**.py" = ["ARG001"]
