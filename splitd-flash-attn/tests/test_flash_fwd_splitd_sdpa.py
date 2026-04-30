@@ -429,6 +429,103 @@ def test_splitd_rejects_bad_cu_seqlens_dtype():
         )
 
 
+@retry_on_oom
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_splitd_rejects_fp16_training_inputs():
+    device = "cuda"
+    total_tokens = 128
+    q = torch.empty(total_tokens, 4, 512, device=device, dtype=torch.float16, requires_grad=True)
+    k = torch.empty(total_tokens, 4, 512, device=device, dtype=torch.float16, requires_grad=True)
+    v = torch.empty(total_tokens, 4, 512, device=device, dtype=torch.float16, requires_grad=True)
+    cu_seqlens = torch.tensor([0, 64, 128], device=device, dtype=torch.int32)
+
+    with pytest.raises(NotImplementedError, match="bfloat16 only"):
+        split_flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=64,
+            max_seqlen_k=64,
+        )
+
+
+@retry_on_oom
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_splitd_rejects_missing_varlen_max_seqlen():
+    device = "cuda"
+    dtype = torch.bfloat16
+    total_tokens = 128
+    q = torch.empty(total_tokens, 4, 512, device=device, dtype=dtype)
+    k = torch.empty(total_tokens, 4, 512, device=device, dtype=dtype)
+    v = torch.empty(total_tokens, 4, 512, device=device, dtype=dtype)
+    cu_seqlens = torch.tensor([0, 64, 128], device=device, dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="max_seqlen_q"):
+        split_flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_k=64,
+        )
+
+
+@pytest.mark.parametrize(
+    "cu_values,match",
+    [
+        ([1, 64, 128], r"cu_seqlens_q\[0\]"),
+        ([0, 64, 127], r"cu_seqlens_q\[-1\]"),
+        ([0, 128, 64, 128], "monotonically non-decreasing"),
+    ],
+    ids=["bad_start", "bad_end", "nonmonotonic"],
+)
+@retry_on_oom
+def test_splitd_rejects_bad_cu_seqlens_values(cu_values, match):
+    device = "cuda"
+    dtype = torch.bfloat16
+    total_tokens = 128
+    q = torch.empty(total_tokens, 4, 512, device=device, dtype=dtype)
+    k = torch.empty(total_tokens, 4, 512, device=device, dtype=dtype)
+    v = torch.empty(total_tokens, 4, 512, device=device, dtype=dtype)
+    cu_seqlens = torch.tensor(cu_values, device=device, dtype=torch.int32)
+
+    with pytest.raises(ValueError, match=match):
+        split_flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=128,
+            max_seqlen_k=128,
+        )
+
+
+@retry_on_oom
+def test_splitd_rejects_too_small_max_seqlen():
+    device = "cuda"
+    dtype = torch.bfloat16
+    total_tokens = 128
+    q = torch.empty(total_tokens, 4, 512, device=device, dtype=dtype)
+    k = torch.empty(total_tokens, 4, 512, device=device, dtype=dtype)
+    v = torch.empty(total_tokens, 4, 512, device=device, dtype=dtype)
+    cu_seqlens = torch.tensor([0, 32, 128], device=device, dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="max_seqlen_q"):
+        split_flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=64,
+            max_seqlen_k=128,
+        )
+
+
 # ---------------------------------------------------------------------------
 # test_splitd_lse — LSE correctness
 # ---------------------------------------------------------------------------

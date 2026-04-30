@@ -18,7 +18,7 @@ import cutlass.cute as cute
 from cutlass import Int32, Float32
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from .cache_utils import get_jit_cache
-from .testing import is_fake_mode
+from .runtime import is_fake_mode
 
 
 if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
@@ -47,6 +47,7 @@ FWD_TILE_M = 64
 FWD_TILE_N = 128
 BWD_TILE_M = 64
 BWD_TILE_N = 64
+_VARLEN_CUSTOM_OP_NONE_INT = -(2**31)
 
 
 # ---------------------------------------------------------------------------
@@ -80,14 +81,32 @@ def _validate_head_dims(head_dim: int, head_dim_v: int) -> None:
     if head_dim != SUPPORTED_HEAD_DIM or head_dim_v != SUPPORTED_HEAD_DIM:
         raise ValueError(
             f"(head_dim, head_dim_v)=({head_dim}, {head_dim_v}) is not supported. "
-            f"This SplitD interface requires head_dim == {SUPPORTED_HEAD_DIM} and "
-            f"head_dim_v == {SUPPORTED_HEAD_DIM}, matching the kernel's fixed "
+            f"This SplitD interface requires q/k head_dim == {SUPPORTED_HEAD_DIM} and "
+            f"v head_dim_v == {SUPPORTED_HEAD_DIM}, matching the kernel's fixed "
             "8x64 D-slice layout."
         )
 
 
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and not x.is_contiguous() else x
+
+
+def _encode_optional_int_for_custom_op(value: Optional[int]) -> int:
+    return _VARLEN_CUSTOM_OP_NONE_INT if value is None else int(value)
+
+
+def _decode_optional_int_from_custom_op(value: int) -> Optional[int]:
+    return None if value == _VARLEN_CUSTOM_OP_NONE_INT else value
+
+
+def _decode_custom_op_window(
+    window_size_left: int,
+    window_size_right: int,
+) -> Tuple[Optional[int], Optional[int]]:
+    return (
+        _decode_optional_int_from_custom_op(window_size_left),
+        _decode_optional_int_from_custom_op(window_size_right),
+    )
 
 
 def _validate_tensor(tensor, name, expected_shape, expected_dtype, expected_device):
@@ -101,17 +120,74 @@ def _validate_tensor(tensor, name, expected_shape, expected_dtype, expected_devi
         raise RuntimeError(f"{name} is on {tensor.device}, expected {expected_device}")
 
 
-def _validate_cu_seqlens(tensor, name, batch_size: Optional[int] = None) -> None:
+def _validate_sm90_arch() -> int:
+    arch = _get_device_arch()
+    if arch // 10 != 9:
+        raise RuntimeError(
+            f"This SM90-only SplitD interface requires Hopper (SM 9.x), got compute capability {arch}. "
+            "Use the full flash-attention interface for other architectures."
+        )
+    return arch
+
+
+def _validate_training_dtype(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, requires_grad: bool) -> None:
+    if requires_grad and q.dtype != torch.bfloat16:
+        raise NotImplementedError(
+            "SplitD training currently supports torch.bfloat16 only. "
+            f"Got q/k/v dtype {q.dtype}; use bfloat16 inputs or a different attention backend."
+        )
+
+
+def _validate_cu_seqlens(
+    tensor,
+    name,
+    batch_size: Optional[int] = None,
+    total_tokens: Optional[int] = None,
+) -> None:
     if tensor is None:
         return
     if tensor.ndim != 1:
         raise ValueError(f"{name} must be a 1D tensor, got rank {tensor.ndim}")
+    if tensor.numel() == 0:
+        raise ValueError(f"{name} must have at least one element")
     if batch_size is not None and tensor.shape != (batch_size + 1,):
         raise ValueError(f"{name} must have shape ({batch_size + 1},), got {tensor.shape}")
     if tensor.dtype != torch.int32:
         raise TypeError(f"{name} must have dtype torch.int32, got {tensor.dtype}")
     if tensor.stride(0) != 1:
         raise ValueError(f"{name} must be contiguous")
+    if is_fake_mode():
+        return
+    if not tensor.is_cuda:
+        raise RuntimeError(f"{name} must be on a CUDA device, got {tensor.device}")
+
+    first = int(tensor[0].item())
+    if first != 0:
+        raise ValueError(f"{name}[0] must be 0, got {first}")
+    if total_tokens is not None:
+        last = int(tensor[-1].item())
+        if last != total_tokens:
+            raise ValueError(f"{name}[-1] must equal total tokens ({total_tokens}), got {last}")
+    if tensor.numel() > 1 and bool(torch.any(tensor[1:] < tensor[:-1]).item()):
+        raise ValueError(f"{name} must be monotonically non-decreasing")
+
+
+def _validate_max_seqlen_for_cu_seqlens(tensor, name, max_seqlen, max_name) -> None:
+    if tensor is None:
+        return
+    if max_seqlen is None:
+        raise ValueError(f"{max_name} must be provided when {name} is provided")
+    if isinstance(max_seqlen, bool) or not isinstance(max_seqlen, int):
+        raise TypeError(f"{max_name} must be an int, got {type(max_seqlen).__name__}")
+    if max_seqlen < 0:
+        raise ValueError(f"{max_name} must be non-negative, got {max_seqlen}")
+    if is_fake_mode():
+        return
+
+    lengths = tensor[1:] - tensor[:-1]
+    actual_max = int(lengths.max().item()) if lengths.numel() > 0 else 0
+    if max_seqlen < actual_max:
+        raise ValueError(f"{max_name} ({max_seqlen}) must be >= max sequence length from {name} ({actual_max})")
 
 
 def _ensure_cuda_tensors(*named_tensors) -> None:
@@ -147,10 +223,10 @@ def _validate_qkv_common(
         batch_size, seqlen_q = q.shape[:2]
         total_q = batch_size * seqlen_q
     else:
-        _validate_cu_seqlens(cu_seqlens_q, "cu_seqlens_q")
-        batch_size = cu_seqlens_q.shape[0] - 1
+        batch_size = cu_seqlens_q.numel() - 1
         seqlen_q = None
         total_q = q.shape[0]
+        _validate_cu_seqlens(cu_seqlens_q, "cu_seqlens_q", batch_size, total_tokens=total_q)
 
     if k.shape[-1] != head_dim:
         raise ValueError(f"k head_dim is {k.shape[-1]}, expected {head_dim}")
@@ -163,16 +239,13 @@ def _validate_qkv_common(
         expected_k_shape = (batch_size, seqlen_k, num_head_kv, head_dim)
         expected_v_shape = (batch_size, seqlen_k, num_head_kv, head_dim_v)
     else:
-        _validate_cu_seqlens(cu_seqlens_k, "cu_seqlens_k", batch_size)
+        _validate_cu_seqlens(cu_seqlens_k, "cu_seqlens_k", batch_size, total_tokens=seqlen_k)
         expected_k_shape = (seqlen_k, num_head_kv, head_dim)
         expected_v_shape = (seqlen_k, num_head_kv, head_dim_v)
     if k.shape != expected_k_shape:
         raise ValueError(f"k has shape {k.shape}, expected {expected_k_shape}")
     if v.shape != expected_v_shape:
         raise ValueError(f"v has shape {v.shape}, expected {expected_v_shape}")
-    if cu_seqlens_q is not None:
-        _validate_cu_seqlens(cu_seqlens_q, "cu_seqlens_q", batch_size)
-
     if q.dtype not in torch2cute_dtype_map:
         raise TypeError("SM90 CuTe inputs must be torch.float16 or torch.bfloat16")
     if q.dtype != k.dtype or q.dtype != v.dtype:
@@ -245,6 +318,42 @@ def _resolve_causal_local_window(causal, window_size_left, window_size_right, ma
     return causal, local, window_size_left, window_size_right
 
 
+def _validate_varlen_custom_fwd_features(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    softcap: float,
+) -> None:
+    window_size_left_opt, window_size_right_opt = _decode_custom_op_window(window_size_left, window_size_right)
+    softcap_opt = None if softcap == 0.0 else softcap
+    _, local, _, _ = _resolve_causal_local_window(causal, window_size_left_opt, window_size_right_opt)
+    _unsupported_training_features(
+        q.requires_grad or k.requires_grad or v.requires_grad,
+        softcap_opt,
+        local,
+        None,
+        None,
+        None,
+    )
+
+
+def _validate_varlen_custom_bwd_features(
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    softcap: float,
+) -> None:
+    if softcap != 0.0:
+        raise NotImplementedError("SplitD backward does not support softcap yet")
+    window_size_left_opt, window_size_right_opt = _decode_custom_op_window(window_size_left, window_size_right)
+    _, local, _, _ = _resolve_causal_local_window(causal, window_size_left_opt, window_size_right_opt)
+    if local:
+        raise NotImplementedError("SplitD backward does not support local/window attention yet")
+
+
 # ---------------------------------------------------------------------------
 # Forward pass — SplitD SM90 (training, head_dim == 512)
 # ---------------------------------------------------------------------------
@@ -284,12 +393,12 @@ def _flash_attn_fwd_sm90(
         head_dim_v,
     ) = _validate_qkv_common(q, k, v, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k)
 
-    arch = _get_device_arch()
-    if arch // 10 != 9:
-        raise RuntimeError(
-            f"This SM90-only interface requires Hopper (SM 9.x), got compute capability {arch}. "
-            "Use the full interface.py for other architectures."
-        )
+    requires_grad = q.requires_grad or k.requires_grad or v.requires_grad
+    _validate_training_dtype(q, k, v, requires_grad)
+    _validate_max_seqlen_for_cu_seqlens(cu_seqlens_q, "cu_seqlens_q", max_seqlen_q, "max_seqlen_q")
+    _validate_max_seqlen_for_cu_seqlens(cu_seqlens_k, "cu_seqlens_k", max_seqlen_k, "max_seqlen_k")
+
+    arch = _validate_sm90_arch()
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
     if softcap == 0.0:
@@ -302,7 +411,6 @@ def _flash_attn_fwd_sm90(
     out_torch_dtype = q.dtype
     q_batch_seqlen_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
     lse_shape = (batch_size, num_head, seqlen_q) if cu_seqlens_q is None else (num_head, total_q)
-    requires_grad = q.requires_grad or k.requires_grad or v.requires_grad
 
     if out is None:
         out = torch.empty(*q_batch_seqlen_shape, num_head, head_dim_v, dtype=out_torch_dtype, device=device)
@@ -454,45 +562,24 @@ _flash_attn_fwd_sm90.compile_cache = get_jit_cache("fwd_sm90")
 # ---------------------------------------------------------------------------
 
 
-def make_fake_bwd_tensors(dtype, has_gqa, varlen_q, varlen_k):
+def _make_fake_bwd_preprocess_tensors(dtype, varlen_q):
     sym = cute.sym_int
     div = 128 // dtype.width  # 8 for fp16/bf16
-    b, seqlen_q, seqlen_k, h_q, d, d_v = sym(), sym(), sym(), sym(), sym(), sym()
-    h_kv = h_q if not has_gqa else sym()
-    seqlen_q_rounded, seqlen_k_rounded = sym(), sym()
-    seqlen_q_d_rounded, seqlen_k_d_rounded, seqlen_k_dv_rounded = sym(), sym(), sym()
-    total_q, total_k, total_q_rounded, total_k_rounded = sym(), sym(), sym(), sym()
-    total_q_d_rounded, total_k_d_rounded, total_k_dv_rounded = sym(), sym(), sym()
+    b, seqlen_q, h_q, d_v = sym(), sym(), sym(), sym()
+    seqlen_q_rounded = sym()
+    total_q, total_q_rounded = sym(), sym()
     b_seqlenq = (b, seqlen_q) if not varlen_q else (total_q,)
-    b_seqlenk = (b, seqlen_k) if not varlen_k else (total_k,)
-    mQ = fake_tensor(dtype, (*b_seqlenq, h_q, d), divisibility=div)
     mO = fake_tensor(dtype, (*b_seqlenq, h_q, d_v), divisibility=div)
     mdO = fake_tensor(dtype, (*b_seqlenq, h_q, d_v), divisibility=div)
-    mK = fake_tensor(dtype, (*b_seqlenk, h_kv, d), divisibility=div)
-    mV = fake_tensor(dtype, (*b_seqlenk, h_kv, d_v), divisibility=div)
-    mdQ = fake_tensor(dtype, (*b_seqlenq, h_q, d), divisibility=div)
-    mdK = fake_tensor(dtype, (*b_seqlenk, h_kv, d), divisibility=div)
-    mdV = fake_tensor(dtype, (*b_seqlenk, h_kv, d_v), divisibility=div)
     if not varlen_q:
         mLSE = fake_tensor(Float32, (b, h_q, seqlen_q), divisibility=1)
         mLSElog2 = fake_tensor(Float32, (b, h_q, seqlen_q_rounded), divisibility=4)
         mPdPsum = fake_tensor(Float32, (b, h_q, seqlen_q_rounded), divisibility=4)
-        dQaccum = fake_tensor(Float32, (b, h_q, seqlen_q_d_rounded), divisibility=4)
     else:
         mLSE = fake_tensor(Float32, (h_q, total_q), divisibility=1)
         mLSElog2 = fake_tensor(Float32, (h_q, total_q_rounded), divisibility=4)
         mPdPsum = fake_tensor(Float32, (h_q, total_q_rounded), divisibility=4)
-        dQaccum = fake_tensor(Float32, (h_q, total_q_d_rounded), divisibility=4)
-    if not has_gqa:
-        mdKaccum, mdVaccum = None, None
-    else:
-        if not varlen_k:
-            mdKaccum = fake_tensor(Float32, (b, h_kv, seqlen_k_rounded), divisibility=4)
-            mdVaccum = fake_tensor(Float32, (b, h_kv, seqlen_k_dv_rounded), divisibility=4)
-        else:
-            mdKaccum = fake_tensor(Float32, (h_kv, total_k_rounded), divisibility=4)
-            mdVaccum = fake_tensor(Float32, (h_kv, total_k_dv_rounded), divisibility=4)
-    return mQ, mK, mV, mO, mdO, mdQ, mdK, mdV, mLSE, mLSElog2, mPdPsum, dQaccum, mdKaccum, mdVaccum
+    return mO, mdO, mLSE, mLSElog2, mPdPsum
 
 
 def _compile_bwd_preprocess(
@@ -501,18 +588,12 @@ def _compile_bwd_preprocess(
     head_dim_v,
     m_block_size,
     has_cuseqlens_q,
-    has_seqused_q,
     has_dlse,
-    has_dqaccum=True,
 ):
     """Compile bwd preprocess kernel using cute fake tensors."""
-    mQ, mK, mV, mO, mdO, mdQ, mdK, mdV, mLSE, mLSElog2, mPdPsum, mdQaccum, mdKaccum, mdVaccum = make_fake_bwd_tensors(
-        dtype, has_gqa=True, varlen_q=has_cuseqlens_q, varlen_k=False
-    )
-    batch = mQ.shape[0] if not has_cuseqlens_q else cute.sym_int()
     batchp1 = cute.sym_int()
+    mO, mdO, mLSE, mLSElog2, mPdPsum = _make_fake_bwd_preprocess_tensors(dtype, varlen_q=has_cuseqlens_q)
     mCuSeqlensQ = fake_tensor(Int32, (batchp1,), divisibility=1) if has_cuseqlens_q else None
-    mSequsedQ = fake_tensor(Int32, (batch,), divisibility=1) if has_seqused_q else None
     mdLSE = fake_tensor(Float32, mLSE.shape, divisibility=1) if has_dlse else None
     fa_bwd_pre = FlashAttentionBackwardPreprocess(dtype, head_dim, head_dim_v, m_block_size)
     return cute.compile(
@@ -522,9 +603,9 @@ def _compile_bwd_preprocess(
         mPdPsum,
         mLSE,
         mLSElog2,
-        mdQaccum if has_dqaccum else None,
+        None,
         mCuSeqlensQ,
-        mSequsedQ,
+        None,
         mdLSE,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
@@ -537,34 +618,27 @@ def _bwd_preprocess(
     dpsum,
     lse,
     lse_log2,
-    dq_accum,
     cu_seqlens_q,
-    seqused_q,
     dlse,
     dtype,
     head_dim,
     head_dim_v,
     m_block_size,
 ):
-    """Backward preprocess: compute (o * dout).sum(dim=-1) - dLSE, lse * log2_e, and zero out dq_accum."""
+    """Backward preprocess: compute (o * dout).sum(dim=-1) - dLSE, and lse * log2_e."""
     is_varlen = cu_seqlens_q is not None
-    has_dqaccum = dq_accum is not None
     compile_key = (
         dtype,
         head_dim,
         head_dim_v,
         m_block_size,
         is_varlen,
-        seqused_q is not None,
         dlse is not None,
-        has_dqaccum,
     )
     if compile_key not in _bwd_preprocess.compile_cache:
         _bwd_preprocess.compile_cache[compile_key] = _compile_bwd_preprocess(*compile_key)
     if not is_fake_mode():
-        _bwd_preprocess.compile_cache[compile_key](
-            out, dout, dpsum, lse, lse_log2, dq_accum, cu_seqlens_q, seqused_q, dlse
-        )
+        _bwd_preprocess.compile_cache[compile_key](out, dout, dpsum, lse, lse_log2, None, cu_seqlens_q, None, dlse)
 
 
 _bwd_preprocess.compile_cache = get_jit_cache("bwd_pre_sm90")
@@ -597,9 +671,7 @@ def _flash_attn_bwd_sm90(
     dlse: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """SplitD SM90 backward pass (training only, head_dim == 512)."""
-    arch = _get_device_arch()
-    if arch // 10 != 9:
-        raise RuntimeError(f"This SM90-only interface requires Hopper (SM 9.x), got compute capability {arch}.")
+    _validate_sm90_arch()
 
     if softcap != 0.0:
         raise NotImplementedError("SplitD backward does not support softcap yet")
@@ -627,6 +699,8 @@ def _flash_attn_bwd_sm90(
         head_dim,
         head_dim_v,
     ) = _validate_qkv_common(q, k, v, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k)
+    _validate_max_seqlen_for_cu_seqlens(cu_seqlens_q, "cu_seqlens_q", max_seqlen_q, "max_seqlen_q")
+    _validate_max_seqlen_for_cu_seqlens(cu_seqlens_k, "cu_seqlens_k", max_seqlen_k, "max_seqlen_k")
     if q.dtype == torch.float16:
         raise NotImplementedError(
             "SplitD backward currently supports bfloat16 only; the fp16 dQ path has a known launch failure."
@@ -670,9 +744,6 @@ def _flash_attn_bwd_sm90(
     else:
         _validate_tensor(dv, "dv", v.shape, out_torch_dtype, device)
 
-    # SplitD writes dQ directly, no fp32 accumulator needed
-    dq_accum = None
-
     if cu_seqlens_q is None:
         dpsum = torch.empty(batch_size, num_head, seqlen_q_rounded, dtype=torch.float32, device=device)
         lse_log2 = torch.empty(batch_size, num_head, seqlen_q_rounded, dtype=torch.float32, device=device)
@@ -684,16 +755,14 @@ def _flash_attn_bwd_sm90(
     dtype = torch2cute_dtype_map[q.dtype]
     current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
-    # (1) Preprocess (seqused_q=None since seqused is removed)
+    # (1) Preprocess dpsum and lse_log2 for the SplitD backward kernels.
     _bwd_preprocess(
         out,
         dout,
         dpsum,
         lse,
         lse_log2,
-        dq_accum,
         cu_seqlens_q,
-        None,
         dlse,
         dtype,
         head_dim,
@@ -702,7 +771,7 @@ def _flash_attn_bwd_sm90(
     )
 
     # (2) Compile and execute SplitD dKdV and dQ kernels
-    dkdv_key = (
+    bwd_key = (
         dtype,
         head_dim,
         head_dim_v,
@@ -713,7 +782,7 @@ def _flash_attn_bwd_sm90(
         cu_seqlens_k is not None,
         qhead_per_kvhead,
     )
-    if dkdv_key not in _flash_attn_bwd_sm90.compile_cache_dkdv:
+    if bwd_key not in _flash_attn_bwd_sm90.compile_cache_dkdv:
         q_t, k_t, v_t, do_t = [to_cute_tensor(t) for t in (q, k, v, dout)]
         dk_t, dv_t = [to_cute_tensor(t) for t in (dk, dv)]
         lse_log2_t = to_cute_tensor(lse_log2, assumed_align=4)
@@ -734,7 +803,7 @@ def _flash_attn_bwd_sm90(
             tile_m=m_block_size,
             tile_n=n_block_size,
         )
-        _flash_attn_bwd_sm90.compile_cache_dkdv[dkdv_key] = cute.compile(
+        _flash_attn_bwd_sm90.compile_cache_dkdv[bwd_key] = cute.compile(
             fa_dkdv,
             q_t,
             k_t,
@@ -751,18 +820,7 @@ def _flash_attn_bwd_sm90(
             options=("--enable-tvm-ffi --ptxas-options '--verbose --warn-on-spills --warn-on-local-memory-usage'"),
         )
 
-    dq_key = (
-        dtype,
-        head_dim,
-        head_dim_v,
-        causal,
-        m_block_size,
-        n_block_size,
-        cu_seqlens_q is not None,
-        cu_seqlens_k is not None,
-        qhead_per_kvhead,
-    )
-    if dq_key not in _flash_attn_bwd_sm90.compile_cache_dq:
+    if bwd_key not in _flash_attn_bwd_sm90.compile_cache_dq:
         q_t2, k_t2, v_t2, do_t2 = [to_cute_tensor(t) for t in (q, k, v, dout)]
         dq_t = to_cute_tensor(dq)
         lse_log2_t2 = to_cute_tensor(lse_log2, assumed_align=4)
@@ -783,7 +841,7 @@ def _flash_attn_bwd_sm90(
             tile_m=m_block_size,
             tile_n=n_block_size,
         )
-        _flash_attn_bwd_sm90.compile_cache_dq[dq_key] = cute.compile(
+        _flash_attn_bwd_sm90.compile_cache_dq[bwd_key] = cute.compile(
             fa_dq,
             q_t2,
             k_t2,
@@ -801,7 +859,7 @@ def _flash_attn_bwd_sm90(
 
     # Execute dKdV and dQ kernels
     if not is_fake_mode():
-        _flash_attn_bwd_sm90.compile_cache_dkdv[dkdv_key](
+        _flash_attn_bwd_sm90.compile_cache_dkdv[bwd_key](
             q.detach(),
             k.detach(),
             v.detach(),
@@ -814,7 +872,7 @@ def _flash_attn_bwd_sm90(
             cu_seqlens_q,
             cu_seqlens_k,
         )
-        _flash_attn_bwd_sm90.compile_cache_dq[dq_key](
+        _flash_attn_bwd_sm90.compile_cache_dq[bwd_key](
             q.detach(),
             k.detach(),
             v.detach(),
@@ -832,6 +890,223 @@ def _flash_attn_bwd_sm90(
 
 _flash_attn_bwd_sm90.compile_cache_dkdv = get_jit_cache("bwd_splitd_dkdv_sm90")
 _flash_attn_bwd_sm90.compile_cache_dq = get_jit_cache("bwd_splitd_dq_sm90")
+
+
+# ---------------------------------------------------------------------------
+# PyTorch custom ops — varlen SplitD SM90
+# ---------------------------------------------------------------------------
+
+# These dispatcher ops are intentionally return-oriented and functional from
+# PyTorch's point of view: ``mutates_args=()`` only says input arguments are not
+# mutated.  The CUTE kernels still write output storage directly, but that
+# storage belongs to tensors allocated inside ``_flash_attn_fwd_sm90`` /
+# ``_flash_attn_bwd_sm90`` and returned to the caller.  Do not add Python
+# ``copy_`` here; buffer-oriented legacy APIs should call the lower-level
+# wrappers with ``out`` / ``dq`` / ``dk`` / ``dv`` if they need caller-owned
+# storage identity.
+
+
+@torch.library.custom_op("splitd_flash_attn::varlen_fwd", mutates_args=())
+def _varlen_fwd_custom(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float,
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    softcap: float,
+    pack_gqa: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    window_size_left_opt, window_size_right_opt = _decode_custom_op_window(window_size_left, window_size_right)
+    return _flash_attn_fwd_sm90(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size_left=window_size_left_opt,
+        window_size_right=window_size_right_opt,
+        softcap=softcap,
+        pack_gqa=pack_gqa,
+        return_lse=True,
+    )
+
+
+@torch.library.register_fake("splitd_flash_attn::varlen_fwd")
+def _varlen_fwd_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float,
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    softcap: float,
+    pack_gqa: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    (
+        _batch_size,
+        _seqlen_q,
+        total_q,
+        _seqlen_k,
+        num_head,
+        _num_head_kv,
+        _head_dim,
+        head_dim_v,
+    ) = _validate_qkv_common(q, k, v, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k)
+    _validate_training_dtype(q, k, v, q.requires_grad or k.requires_grad or v.requires_grad)
+    _validate_max_seqlen_for_cu_seqlens(cu_seqlens_q, "cu_seqlens_q", max_seqlen_q, "max_seqlen_q")
+    _validate_max_seqlen_for_cu_seqlens(cu_seqlens_k, "cu_seqlens_k", max_seqlen_k, "max_seqlen_k")
+    _validate_varlen_custom_fwd_features(q, k, v, causal, window_size_left, window_size_right, softcap)
+    out = q.new_empty((total_q, num_head, head_dim_v))
+    lse = q.new_empty((num_head, total_q), dtype=torch.float32)
+    return out, lse
+
+
+@torch.library.custom_op("splitd_flash_attn::varlen_bwd", mutates_args=())
+def _varlen_bwd_custom(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    dout: torch.Tensor,
+    lse: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float,
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    softcap: float,
+    dlse: Optional[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    window_size_left_opt, window_size_right_opt = _decode_custom_op_window(window_size_left, window_size_right)
+    return _flash_attn_bwd_sm90(
+        q,
+        k,
+        v,
+        out,
+        dout,
+        lse,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        softcap=softcap,
+        window_size_left=window_size_left_opt,
+        window_size_right=window_size_right_opt,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        dlse=dlse,
+    )
+
+
+@torch.library.register_fake("splitd_flash_attn::varlen_bwd")
+def _varlen_bwd_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    dout: torch.Tensor,
+    lse: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float,
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    softcap: float,
+    dlse: Optional[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    (
+        _batch_size,
+        _seqlen_q,
+        total_q,
+        _seqlen_k,
+        num_head,
+        _num_head_kv,
+        _head_dim,
+        head_dim_v,
+    ) = _validate_qkv_common(q, k, v, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k)
+    _validate_max_seqlen_for_cu_seqlens(cu_seqlens_q, "cu_seqlens_q", max_seqlen_q, "max_seqlen_q")
+    _validate_max_seqlen_for_cu_seqlens(cu_seqlens_k, "cu_seqlens_k", max_seqlen_k, "max_seqlen_k")
+    if q.dtype == torch.float16:
+        raise NotImplementedError(
+            "SplitD backward currently supports bfloat16 only; the fp16 dQ path has a known launch failure."
+        )
+    _validate_varlen_custom_bwd_features(causal, window_size_left, window_size_right, softcap)
+    device = q.device
+    _validate_tensor(out, "out", (total_q, num_head, head_dim_v), q.dtype, device)
+    _validate_tensor(dout, "dout", (total_q, num_head, head_dim_v), q.dtype, device)
+    _validate_tensor(lse, "lse", (num_head, total_q), torch.float32, device)
+    if dlse is not None:
+        _validate_tensor(dlse, "dlse", (num_head, total_q), torch.float32, device)
+    return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+
+
+def _varlen_fwd_setup_context(ctx, inputs, output) -> None:
+    q, k, v, cu_seqlens_q, cu_seqlens_k = inputs[:5]
+    max_seqlen_q, max_seqlen_k, softmax_scale, causal = inputs[5:9]
+    window_size_left, window_size_right, softcap = inputs[9:12]
+    out, lse = output
+    ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k)
+    ctx.max_seqlen_q = max_seqlen_q
+    ctx.max_seqlen_k = max_seqlen_k
+    ctx.softmax_scale = softmax_scale
+    ctx.causal = causal
+    ctx.window_size_left = window_size_left
+    ctx.window_size_right = window_size_right
+    ctx.softcap = softcap
+    ctx.set_materialize_grads(False)
+
+
+def _varlen_fwd_backward(ctx, dout, dlse):
+    q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k = ctx.saved_tensors
+    if dout is None:
+        dout = torch.zeros_like(out)
+    dq, dk, dv = torch.ops.splitd_flash_attn.varlen_bwd(
+        q,
+        k,
+        v,
+        out,
+        dout,
+        lse,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        ctx.max_seqlen_q,
+        ctx.max_seqlen_k,
+        ctx.softmax_scale,
+        ctx.causal,
+        ctx.window_size_left,
+        ctx.window_size_right,
+        ctx.softcap,
+        dlse,
+    )
+    return dq, dk, dv, *((None,) * 10)
+
+
+torch.library.register_autograd(
+    "splitd_flash_attn::varlen_fwd",
+    _varlen_fwd_backward,
+    setup_context=_varlen_fwd_setup_context,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -898,81 +1173,49 @@ class FlashAttnFunc(torch.autograd.Function):
         return dq, dk, dv, *((None,) * 6)
 
 
-class FlashAttnVarlenFunc(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        cu_seqlens_q: Optional[torch.Tensor] = None,
-        cu_seqlens_k: Optional[torch.Tensor] = None,
-        max_seqlen_q: Optional[int] = None,
-        max_seqlen_k: Optional[int] = None,
-        softmax_scale: Optional[float] = None,
-        causal: bool = False,
-        window_size: Tuple[Optional[int], Optional[int]] = (None, None),
-        softcap: float = 0.0,
-        pack_gqa: Optional[bool] = None,
-        score_mod: Optional[Callable] = None,
-        aux_tensors: Optional[list] = None,
-        return_lse: bool = False,
-    ):
-        out, lse = _flash_attn_fwd_sm90(
-            q,
-            k,
-            v,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            window_size_left=window_size[0],
-            window_size_right=window_size[1],
-            softcap=softcap,
-            pack_gqa=pack_gqa,
-            score_mod=score_mod,
-            aux_tensors=aux_tensors,
-            return_lse=return_lse,
-        )
-        ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k)
-        ctx.softmax_scale = softmax_scale
-        ctx.causal = causal
-        ctx.window_size = window_size
-        ctx.softcap = softcap
-        ctx.max_seqlen_q = max_seqlen_q
-        ctx.max_seqlen_k = max_seqlen_k
-        ctx.return_lse = return_lse
-        ctx.set_materialize_grads(False)
-        return out, lse
+def _normalize_varlen_custom_op_inputs(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cu_seqlens_q: Optional[torch.Tensor],
+    cu_seqlens_k: Optional[torch.Tensor],
+    max_seqlen_q: Optional[int],
+    max_seqlen_k: Optional[int],
+    softmax_scale: Optional[float],
+    window_size: Tuple[Optional[int], Optional[int]],
+    pack_gqa: Optional[bool],
+    score_mod: Optional[Callable],
+    aux_tensors: Optional[list],
+) -> tuple[torch.Tensor, torch.Tensor, int, int, float, int, int, bool]:
+    if cu_seqlens_q is None or cu_seqlens_k is None:
+        raise ValueError("split_flash_attn_varlen_func custom op path requires cu_seqlens_q and cu_seqlens_k")
+    if max_seqlen_q is None:
+        raise ValueError("max_seqlen_q must be provided when cu_seqlens_q is provided")
+    if max_seqlen_k is None:
+        raise ValueError("max_seqlen_k must be provided when cu_seqlens_k is provided")
+    if score_mod is not None:
+        raise NotImplementedError("score_mod is not supported by the SplitD varlen custom op schema")
+    if aux_tensors is not None:
+        raise NotImplementedError("aux_tensors is not supported by the SplitD varlen custom op schema")
+    if not isinstance(window_size, tuple) or len(window_size) != 2:
+        raise TypeError("window_size must be a tuple of (left, right)")
 
-    @staticmethod
-    def backward(ctx, dout, dlse):
-        q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k = ctx.saved_tensors
-        if not ctx.return_lse:
-            dlse = None
-        if dout is None:
-            dout = torch.zeros_like(out)
-        dq, dk, dv = _flash_attn_bwd_sm90(
-            q,
-            k,
-            v,
-            out,
-            dout,
-            lse,
-            ctx.softmax_scale,
-            ctx.causal,
-            ctx.softcap,
-            window_size_left=ctx.window_size[0],
-            window_size_right=ctx.window_size[1],
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=ctx.max_seqlen_q,
-            max_seqlen_k=ctx.max_seqlen_k,
-            dlse=dlse,
-        )
-        return dq, dk, dv, *((None,) * 12)
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(q.shape[-1])
+    if pack_gqa is None:
+        if q.ndim < 3 or k.ndim < 3:
+            raise ValueError("q and k must be rank-3 packed varlen tensors")
+        pack_gqa = q.shape[-2] > k.shape[-2]
+
+    return (
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        float(softmax_scale),
+        _encode_optional_int_for_custom_op(window_size[0]),
+        _encode_optional_int_for_custom_op(window_size[1]),
+        bool(pack_gqa),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -991,6 +1234,10 @@ def split_flash_attn_func(
     pack_gqa: Optional[bool] = None,
     return_lse: bool = False,
 ):
+    """Batched SplitD FlashAttention for D=512 on SM90.
+
+    Training requires bf16 q/k/v. fp16 is accepted only for no-grad forward.
+    """
     out, lse = FlashAttnFunc.apply(
         q,
         k,
@@ -1022,7 +1269,36 @@ def split_flash_attn_varlen_func(
     aux_tensors: Optional[list] = None,
     return_lse: bool = False,
 ):
-    out, lse = FlashAttnVarlenFunc.apply(
+    """Varlen SplitD FlashAttention for D=512 on SM90.
+
+    q/k/v must be packed as (total_tokens, heads, 512). Training requires bf16
+    q/k/v, valid CUDA int32 cu_seqlens, and explicit max_seqlen_q/k whenever
+    the corresponding cu_seqlens tensor is provided. If return_lse=False, LSE is
+    still computed internally when needed for backward.
+    """
+    (
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        softmax_scale,
+        window_size_left,
+        window_size_right,
+        pack_gqa,
+    ) = _normalize_varlen_custom_op_inputs(
+        q,
+        k,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        softmax_scale,
+        window_size,
+        pack_gqa,
+        score_mod,
+        aux_tensors,
+    )
+    out, lse = _varlen_fwd_custom(
         q,
         k,
         v,
@@ -1032,12 +1308,10 @@ def split_flash_attn_varlen_func(
         max_seqlen_k,
         softmax_scale,
         causal,
-        window_size,
+        window_size_left,
+        window_size_right,
         softcap,
         pack_gqa,
-        score_mod,
-        aux_tensors,
-        return_lse,
     )
     return (out, lse) if return_lse else out
 
